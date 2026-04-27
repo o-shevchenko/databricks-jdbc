@@ -471,6 +471,44 @@ public class DatabricksThriftAccessorTest {
 
     assertEquals("HY008", exception.getSQLState());
     assertTrue(exception.getMessage().contains("was cancelled"));
+    assertEquals(1008, exception.getErrorCode()); // EXECUTE_STATEMENT_CANCELLED stable code
+  }
+
+  @Test
+  void testPollingPath_cancelledDuringExecution_throwsWithHY008() throws Exception {
+    setup(false);
+    TExecuteStatementReq request = new TExecuteStatementReq();
+    TExecuteStatementResp executeResp =
+        new TExecuteStatementResp()
+            .setOperationHandle(tOperationHandle)
+            .setStatus(new TStatus().setStatusCode(TStatusCode.SUCCESS_STATUS));
+    when(thriftClient.ExecuteStatement(request)).thenReturn(executeResp);
+
+    // First poll returns RUNNING, second returns CANCELED (simulates cancel during execution)
+    TGetOperationStatusResp runningResp =
+        new TGetOperationStatusResp()
+            .setStatus(new TStatus().setStatusCode(TStatusCode.STILL_EXECUTING_STATUS))
+            .setOperationState(TOperationState.RUNNING_STATE);
+    TGetOperationStatusResp cancelledResp =
+        new TGetOperationStatusResp()
+            .setStatus(new TStatus().setStatusCode(TStatusCode.SUCCESS_STATUS))
+            .setOperationState(TOperationState.CANCELED_STATE);
+    when(thriftClient.GetOperationStatus(operationStatusReq))
+        .thenReturn(runningResp)
+        .thenReturn(cancelledResp);
+
+    Statement statement = mock(Statement.class);
+    when(parentStatement.getStatement()).thenReturn(statement);
+    when(statement.getQueryTimeout()).thenReturn(0);
+
+    DatabricksSQLException exception =
+        assertThrows(
+            DatabricksSQLException.class,
+            () -> accessor.execute(request, parentStatement, session, StatementType.SQL));
+
+    assertEquals("HY008", exception.getSQLState());
+    assertTrue(exception.getMessage().contains("was cancelled"));
+    assertEquals(1008, exception.getErrorCode()); // EXECUTE_STATEMENT_CANCELLED stable code
   }
 
   @Test

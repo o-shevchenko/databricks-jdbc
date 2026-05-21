@@ -43,7 +43,7 @@ public class DatabricksStatement implements IDatabricksStatement, IDatabricksSta
   private int timeoutInSeconds;
   protected final DatabricksConnection connection;
   DatabricksResultSet resultSet;
-  private StatementId statementId;
+  private volatile StatementId statementId; // volatile: cancel() reads from a different thread
   private boolean isClosed;
   private boolean closeOnCompletion;
   private SQLWarning warnings = null;
@@ -181,6 +181,13 @@ public class DatabricksStatement implements IDatabricksStatement, IDatabricksSta
         this.connection.closeStatement(this);
       }
       DatabricksThreadContextHolder.clearStatementInfo();
+      // Safety net: stop any heartbeat for this statement
+      if (statementId != null) {
+        ResultHeartbeatManager mgr = connection.getHeartbeatManager();
+        if (mgr != null) {
+          mgr.stopHeartbeat(statementId);
+        }
+      }
       shutDownExecutor();
       this.updateCount = -1;
       this.isClosed = true;
@@ -254,6 +261,15 @@ public class DatabricksStatement implements IDatabricksStatement, IDatabricksSta
   public void cancel() throws SQLException {
     LOGGER.debug("public void cancel()");
     checkIfClosed();
+
+    // Stop heartbeat on cancel — server operation is being cancelled,
+    // no point continuing to poll it
+    if (statementId != null) {
+      ResultHeartbeatManager mgr = connection.getHeartbeatManager();
+      if (mgr != null) {
+        mgr.stopHeartbeat(statementId);
+      }
+    }
 
     if (statementId != null && !directResultsReceived && !serverOperationClosed) {
       this.connection.getSession().getDatabricksClient().cancelStatement(statementId);
@@ -680,6 +696,8 @@ public class DatabricksStatement implements IDatabricksStatement, IDatabricksSta
     LOGGER.debug("ResultSet executeAsync() for statement {%s}", sql);
     checkIfClosed();
 
+    // No heartbeat during async wait — the user controls polling via getExecutionResult().
+    // Heartbeat starts later when the ResultSet is constructed (after getExecutionResult()).
     resetForNewExecution();
 
     IDatabricksClient client = connection.getSession().getDatabricksClient();
@@ -956,8 +974,16 @@ public class DatabricksStatement implements IDatabricksStatement, IDatabricksSta
    */
   @Override
   public void markDirectResultsReceived() {
-    LOGGER.info("Statement {} received direct results (server closed operation)", statementId);
     this.directResultsReceived = true;
+    // Stop heartbeat — server already closed the operation, no point polling.
+    // Heartbeat may have been started by the ResultSet constructor before this
+    // call (Thrift direct results arrive as SUCCEEDED, not CLOSED).
+    if (statementId != null) {
+      ResultHeartbeatManager mgr = connection.getHeartbeatManager();
+      if (mgr != null) {
+        mgr.stopHeartbeat(statementId);
+      }
+    }
   }
 
   /**
@@ -1027,6 +1053,14 @@ public class DatabricksStatement implements IDatabricksStatement, IDatabricksSta
       closeThread.setName("close-stmt-" + prevStatementId);
       closeThread.start();
       serverOperationClosed = true;
+    }
+
+    // Stop heartbeat for the previous execution before clearing state.
+    if (statementId != null) {
+      ResultHeartbeatManager mgr = connection.getHeartbeatManager();
+      if (mgr != null) {
+        mgr.stopHeartbeat(statementId);
+      }
     }
 
     // Close the previous ResultSet. closeServerOperation() inside resultSet.close()

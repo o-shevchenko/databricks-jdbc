@@ -21,6 +21,7 @@ import com.databricks.jdbc.api.internal.IDatabricksStatementInternal;
 import com.databricks.jdbc.common.Nullable;
 import com.databricks.jdbc.common.StatementType;
 import com.databricks.jdbc.common.util.WarningUtil;
+import com.databricks.jdbc.dbclient.IDatabricksClient;
 import com.databricks.jdbc.dbclient.impl.common.StatementId;
 import com.databricks.jdbc.exception.DatabricksParsingException;
 import com.databricks.jdbc.exception.DatabricksSQLException;
@@ -134,6 +135,7 @@ public class DatabricksResultSet implements IDatabricksResultSet, IDatabricksRes
     this.maxRowsLimit = resolveMaxRowsLimit(parentStatement);
     this.isClosed = false;
     this.wasNull = false;
+    startHeartbeatIfEnabled();
   }
 
   @VisibleForTesting
@@ -204,6 +206,7 @@ public class DatabricksResultSet implements IDatabricksResultSet, IDatabricksRes
     this.maxRowsLimit = resolveMaxRowsLimit(parentStatement);
     this.isClosed = false;
     this.wasNull = false;
+    startHeartbeatIfEnabled();
   }
 
   /* Constructing results for getUDTs, getTypeInfo, getProcedures metadata calls */
@@ -305,6 +308,12 @@ public class DatabricksResultSet implements IDatabricksResultSet, IDatabricksRes
   @Override
   public boolean next() throws SQLException {
     checkIfClosed();
+    if (executionResult == null) {
+      throw new DatabricksSQLException(
+          "Cannot iterate: no result data available. "
+              + "For async execution, call getExecutionResult() first.",
+          DatabricksDriverErrorCode.INVALID_STATE);
+    }
     // Client-side maxRows truncation: stop before delegating to the underlying result
     // implementation when the limit has been reached. This is skipped during
     // getUpdateCount() internal iteration (countingUpdateRows) to avoid breaking DML
@@ -317,7 +326,6 @@ public class DatabricksResultSet implements IDatabricksResultSet, IDatabricksRes
           rowsReturned);
       if (!truncatedByMaxRows) {
         truncatedByMaxRows = true;
-        // Record telemetry for truncated queries so dashboards reflect the truncation
         if (cachedTelemetryCollector != null) {
           cachedTelemetryCollector.recordResultSetIteration(
               statementId.toSQLExecStatementId(), resultSetMetaData.getChunkCount(), false);
@@ -325,7 +333,15 @@ public class DatabricksResultSet implements IDatabricksResultSet, IDatabricksRes
       }
       return false;
     }
-    boolean hasNext = this.executionResult.next();
+    boolean hasNext;
+    try {
+      hasNext = this.executionResult.next();
+    } catch (Exception e) {
+      // Stop heartbeat on iteration failure — prevents keeping the warehouse alive
+      // for an abandoned ResultSet (up to 10 ticks × interval before self-stop).
+      stopHeartbeat();
+      throw e;
+    }
     // Only count rows for customer iteration, not internal DML counting
     // (getUpdateCount() sets countingUpdateRows=true to iterate over affected-row counts
     // without inflating the user-visible row counter).
@@ -336,15 +352,21 @@ public class DatabricksResultSet implements IDatabricksResultSet, IDatabricksRes
       cachedTelemetryCollector.recordResultSetIteration(
           statementId.toSQLExecStatementId(), resultSetMetaData.getChunkCount(), hasNext);
     }
+    if (!hasNext) {
+      stopHeartbeat();
+    }
     return hasNext;
   }
 
   @Override
   public void close() throws DatabricksSQLException {
+    stopHeartbeat();
     // Proactively close server operation when ResultSet is closed explicitly.
     closeServerOperation();
     isClosed = true;
-    this.executionResult.close();
+    if (executionResult != null) {
+      executionResult.close();
+    }
     if (parentStatement != null) {
       parentStatement.handleResultSetClose(this);
     }
@@ -355,6 +377,187 @@ public class DatabricksResultSet implements IDatabricksResultSet, IDatabricksRes
     if (parentStatement != null) {
       parentStatement.closeServerOperation();
     }
+  }
+
+  /** Starts heartbeat polling if enabled on the connection and this result set is eligible. */
+  private void startHeartbeatIfEnabled() {
+    if (parentStatement == null || statementId == null) {
+      return;
+    }
+    if (!isHeartbeatEligible()) {
+      return;
+    }
+
+    try {
+      // Use JDBC unwrap() to handle pooled connection wrappers (HikariCP, DBCP)
+      java.sql.Connection rawConn = parentStatement.getStatement().getConnection();
+      DatabricksConnection conn;
+      if (rawConn instanceof DatabricksConnection) {
+        conn = (DatabricksConnection) rawConn;
+      } else if (rawConn.isWrapperFor(DatabricksConnection.class)) {
+        conn = rawConn.unwrap(DatabricksConnection.class);
+      } else {
+        LOGGER.debug("Cannot start heartbeat: connection is not a DatabricksConnection");
+        return;
+      }
+
+      ResultHeartbeatManager mgr = conn.getHeartbeatManager();
+      if (mgr == null) {
+        return; // heartbeat not enabled
+      }
+
+      // Capture only what the lambda needs — avoid capturing 'this' to prevent
+      // abandoned ResultSets from keeping the warehouse alive via heartbeat.
+      // Note: capturing 'client' retains a reference to the session/connection. If the
+      // connection is GC'd without close(), heartbeat RPCs will fail and self-stop after
+      // maxConsecutiveFailures (10 ticks, ~10 min at 60s interval). Acceptable tradeoff.
+      final IDatabricksClient client = conn.getSession().getDatabricksClient();
+      final StatementId capturedStatementId = this.statementId;
+      final int maxConsecutiveFailures = 10;
+      final java.util.concurrent.atomic.AtomicInteger consecutiveFailures =
+          new java.util.concurrent.atomic.AtomicInteger(0);
+      // Read the stopped flag from the manager on each tick instead of pre-capturing.
+      // Pre-capturing caused an orphan-flag bug: startHeartbeat() internally calls
+      // stopHeartbeat() which removes and replaces the flag, leaving the lambda with a
+      // permanently-true reference. Reading from the manager each tick always gets the
+      // current flag.
+      final ResultHeartbeatManager capturedMgr = mgr;
+
+      Runnable heartbeatTask =
+          () -> {
+            // Read current flag each tick — avoids orphan-flag issue
+            java.util.concurrent.atomic.AtomicBoolean stopped =
+                capturedMgr.getStoppedFlag(capturedStatementId);
+            if (stopped.get()) {
+              return; // client/session may be closed, skip RPC
+            }
+            try {
+              boolean alive = client.checkStatementAlive(capturedStatementId);
+              consecutiveFailures.set(0); // reset on success
+              if (!alive) {
+                LOGGER.info(
+                    "Heartbeat detected terminal state for statement {}, stopping",
+                    capturedStatementId.toSQLExecStatementId());
+                capturedMgr.stopHeartbeat(capturedStatementId);
+              }
+            } catch (Throwable e) {
+              if (e instanceof VirtualMachineError) {
+                capturedMgr.stopHeartbeat(capturedStatementId);
+                throw (VirtualMachineError) e;
+              }
+              if (capturedMgr.getStoppedFlag(capturedStatementId).get()) {
+                return;
+              }
+              if (e instanceof java.sql.SQLFeatureNotSupportedException) {
+                LOGGER.debug(
+                    "Heartbeat not supported by client for statement {}, stopping",
+                    capturedStatementId.toSQLExecStatementId());
+                capturedMgr.stopHeartbeat(capturedStatementId);
+                return;
+              }
+              int failures = consecutiveFailures.incrementAndGet();
+              if (failures == 1) {
+                LOGGER.info(
+                    "Heartbeat failed for statement {} (first failure): {}",
+                    capturedStatementId.toSQLExecStatementId(),
+                    e.getMessage());
+              } else {
+                LOGGER.debug(
+                    "Heartbeat failed for statement {} (failure {}/{}): {}",
+                    capturedStatementId.toSQLExecStatementId(),
+                    failures,
+                    maxConsecutiveFailures,
+                    e.getMessage());
+              }
+              if (failures >= maxConsecutiveFailures) {
+                LOGGER.warn(
+                    "Heartbeat stopped for statement {} after {} consecutive failures. "
+                        + "Server-side results may expire. Last error: {}",
+                    capturedStatementId.toSQLExecStatementId(),
+                    failures,
+                    e.getMessage());
+                capturedMgr.stopHeartbeat(capturedStatementId);
+              }
+            }
+          };
+
+      mgr.startHeartbeat(capturedStatementId, heartbeatTask);
+      LOGGER.debug(
+          "Heartbeat started for statement {} (resultType={}, interval={}s)",
+          capturedStatementId.toSQLExecStatementId(),
+          resultSetType,
+          mgr.getIntervalSeconds());
+    } catch (Exception e) {
+      LOGGER.debug("Failed to start heartbeat: {}", e.getMessage());
+    }
+  }
+
+  /** Stops the heartbeat for this result set's statement. Idempotent. */
+  private void stopHeartbeat() {
+    if (parentStatement == null || statementId == null) {
+      return;
+    }
+    try {
+      // Use same unwrap pattern as startHeartbeatIfEnabled() for pooled connections
+      java.sql.Connection rawConn = parentStatement.getStatement().getConnection();
+      DatabricksConnection conn;
+      if (rawConn instanceof DatabricksConnection) {
+        conn = (DatabricksConnection) rawConn;
+      } else if (rawConn.isWrapperFor(DatabricksConnection.class)) {
+        conn = rawConn.unwrap(DatabricksConnection.class);
+      } else {
+        return;
+      }
+      ResultHeartbeatManager mgr = conn.getHeartbeatManager();
+      if (mgr != null) {
+        mgr.stopHeartbeat(statementId);
+      }
+    } catch (Exception e) {
+      LOGGER.debug("Failed to stop heartbeat: {}", e.getMessage());
+    }
+  }
+
+  /**
+   * Determines whether this result set is eligible for heartbeat polling. Package-visible for
+   * testing.
+   *
+   * <p>Heartbeat is NOT needed when:
+   *
+   * <ul>
+   *   <li>No execution result (nothing to fetch, also covers async PENDING/RUNNING with no data)
+   *   <li>SEA inline (InlineJsonResult): all rows loaded in memory at construction
+   *   <li>Update count (DML): no result rows to keep alive
+   *   <li>Direct results (CLOSED state): server already closed, data fully delivered
+   *   <li>Async execution (PENDING/RUNNING): user controls polling via getExecutionResult()
+   * </ul>
+   */
+  boolean isHeartbeatEligible() {
+    // No execution result — nothing to fetch
+    if (executionResult == null) {
+      return false;
+    }
+    // SEA inline — all data loaded in memory at construction
+    if (resultSetType == ResultSetType.SEA_INLINE) {
+      return false;
+    }
+    // Update count — no result rows
+    if (statementType == StatementType.UPDATE) {
+      return false;
+    }
+    // Check execution state
+    if (executionStatus != null) {
+      com.databricks.jdbc.api.ExecutionState state = executionStatus.getExecutionState();
+      // Direct results — server already closed
+      if (state == com.databricks.jdbc.api.ExecutionState.CLOSED) {
+        return false;
+      }
+      // Async execution — user controls polling
+      if (state == com.databricks.jdbc.api.ExecutionState.PENDING
+          || state == com.databricks.jdbc.api.ExecutionState.RUNNING) {
+        return false;
+      }
+    }
+    return true;
   }
 
   private static TelemetryCollector resolveTelemetryCollector(

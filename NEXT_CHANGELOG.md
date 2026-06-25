@@ -7,6 +7,7 @@
 ### Updated
 
 ### Fixed
+- Fixed `StackOverflowError` / hang when closing a `ResultSet` or `Statement` with `closeOnCompletion()` enabled.
 - Fixed SQL injection vulnerability in binary parameter handling.
 - Fixed `setCatalog()` and `setSchema()` producing invalid SQL (e.g. `SET CATALOG ``name``) when the catalog or schema name was passed already wrapped in backticks. Backticks are now stripped before wrapping, and `getCatalog()`/`getSchema()` return the bare identifier name.
 - Fixed metadata SQL generation for catalog, schema, and table identifiers containing backticks.

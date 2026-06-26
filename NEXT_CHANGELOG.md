@@ -8,6 +8,7 @@
 - Bumped the Databricks SDK for Java dependency from `0.106.0` to `0.118.0`.
 
 ### Fixed
+- Fixed presigned URL credentials not being fully redacted in logs.
 - Fixed access token exposure in DEBUG logs.
 - Fixed `StackOverflowError` / hang when closing a `ResultSet` or `Statement` with `closeOnCompletion()` enabled.
 - Fixed SQL injection vulnerability in binary parameter handling.

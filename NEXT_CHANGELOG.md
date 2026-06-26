@@ -5,6 +5,7 @@
 ### Added
 
 ### Updated
+- Bumped the Databricks SDK for Java dependency from `0.106.0` to `0.118.0`.
 
 ### Fixed
 - Fixed `StackOverflowError` / hang when closing a `ResultSet` or `Statement` with `closeOnCompletion()` enabled.

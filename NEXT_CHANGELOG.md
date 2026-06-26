@@ -8,6 +8,7 @@
 - Bumped the Databricks SDK for Java dependency from `0.106.0` to `0.118.0`.
 
 ### Fixed
+- Fixed access token exposure in DEBUG logs.
 - Fixed `StackOverflowError` / hang when closing a `ResultSet` or `Statement` with `closeOnCompletion()` enabled.
 - Fixed SQL injection vulnerability in binary parameter handling.
 - Fixed `setCatalog()` and `setSchema()` producing invalid SQL (e.g. `SET CATALOG ``name``) when the catalog or schema name was passed already wrapped in backticks. Backticks are now stripped before wrapping, and `getCatalog()`/`getSchema()` return the bare identifier name.
